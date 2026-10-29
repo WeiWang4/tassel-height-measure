@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# 实验数据不入库
+*.csv
+*.xlsx
+*.bin
+raw_log.*
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
