@@ -2,12 +2,33 @@
 
 不依赖固定端口号和固定 VID，换一台电脑、换一个 USB 口都能自己找到。
 """
+import re
 import time
 
 import serial
 from serial.tools import list_ports
 
 LASER_BAUD = 115200
+
+
+def parse_usb_ids(hwid):
+    """兼容两种 hwid 写法:
+    1) USB\\VID_1A86&PID_7523\\...
+    2) USB VID:PID=1A86:7523 SER=...
+    """
+    h = (hwid or "").upper()
+    match = re.search(r"VID[_:]PID[=:]\s*([0-9A-F]{4})[:\s]\s*([0-9A-F]{4})", h)
+    if match:
+        return match.group(1), match.group(2)
+    vid = ""
+    pid = ""
+    match = re.search(r"VID[_:]([0-9A-F]{4})", h)
+    if match:
+        vid = match.group(1)
+    match = re.search(r"PID[_:]([0-9A-F]{4})", h)
+    if match:
+        pid = match.group(1)
+    return vid, pid
 
 
 def _parse_frame(raw):
@@ -86,19 +107,7 @@ def scan_lasers(baud=LASER_BAUD, window=0.6):
     for p in list_candidates():
         ok, frames, last = probe_port(p.device, baud, window)
         if ok:
-            vid = ""
-            pid = ""
-            hwid_upper = (p.hwid or "").upper()
-            if "VID_" in hwid_upper:
-                try:
-                    vid = hwid_upper.split("VID_")[1][:4]
-                except IndexError:
-                    pass
-            if "PID_" in hwid_upper:
-                try:
-                    pid = hwid_upper.split("PID_")[1][:4]
-                except IndexError:
-                    pass
+            vid, pid = parse_usb_ids(p.hwid)
             found.append({
                 "port": p.device,
                 "desc": p.description or "",

@@ -21,6 +21,7 @@
     python dual_sync_gui.py --nolaser      # 只接深度相机
 """
 import csv
+import json
 import os
 import queue
 import sys
@@ -34,8 +35,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 WIN_SEC = 10.0
 LASER_WINDOW = 0.15
-IMG_W, IMG_H = 320, 240
+IMG_W, IMG_H = 280, 210
 SRC_W, SRC_H = 640, 480
+ROI_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "roi_config.json")
+
+# 一次性完成重量级模块导入。主线程与后台线程此后不再执行任何 import 语句，
+# 避免争抢全局导入锁导致界面卡在首帧。
+try:
+    import cv2
+    import numpy as np
+    from PIL import Image, ImageTk
+    IMAGE_DEPS_OK = True
+except ImportError:
+    cv2 = None
+    np = None
+    Image = None
+    ImageTk = None
+    IMAGE_DEPS_OK = False
 
 BG = "#FFFFFF"
 PANEL = "#F5F5F3"
@@ -170,14 +186,20 @@ class App:
         self.cam_info = "相机: 未连接"
         self.latest_rgb = None
         self.latest_depth = None
+        self.latest_ir = None
         self.latest_cam_t = None
+        self.has_ir = False
+        self.depth_sensor = None
+        self.emitter_on = True
+        self._rs = None
         self.roi_cx, self.roi_cy, self.roi_half = SRC_W // 2, SRC_H // 2, 20
+        self.load_roi()
         self.scanning = False
         self.last_rescan = 0.0
         self.pump_ts = deque(maxlen=40)
 
         root.title("激光 + 深度相机 · 同步测定")
-        root.geometry("1220x900")
+        root.geometry("1360x900")
         root.configure(bg=BG)
         root.minsize(1060, 760)
 
@@ -199,6 +221,7 @@ class App:
         root.bind("<Control-z>", lambda e: self.undo())
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.pump()
+        root.after(120, self._bring_to_front)
 
     def _build(self):
         top = tk.Frame(self.root, bg=BG, padx=16)
@@ -239,13 +262,19 @@ class App:
         self.canvas_rgb.grid(row=0, column=0, padx=(0, 6))
         self.canvas_depth = tk.Canvas(imgbox, width=IMG_W, height=IMG_H, bg="#1A1A1A",
                                       highlightthickness=1, highlightbackground=LINE)
-        self.canvas_depth.grid(row=0, column=1)
-        tk.Label(imgbox, text="彩色图（点击设 ROI）", font=FONT_SM, bg=BG,
-                 fg=C_MUTED).grid(row=1, column=0)
-        tk.Label(imgbox, text="深度图（对齐到彩色）", font=FONT_SM, bg=BG,
-                 fg=C_MUTED).grid(row=1, column=1)
+        self.canvas_depth.grid(row=0, column=1, padx=(0, 6))
+        self.canvas_ir = tk.Canvas(imgbox, width=IMG_W, height=IMG_H, bg="#1A1A1A",
+                                   highlightthickness=1, highlightbackground=LINE)
+        self.canvas_ir.grid(row=0, column=2)
 
-        for c in (self.canvas_rgb, self.canvas_depth):
+        tk.Label(imgbox, text="彩色（参考）", font=FONT_SM, bg=BG,
+                 fg=C_MUTED).grid(row=1, column=0)
+        tk.Label(imgbox, text="深度（点击设 ROI）", font=FONT_SM, bg=BG,
+                 fg=C_MUTED).grid(row=1, column=1)
+        tk.Label(imgbox, text="红外 · 看激光光斑", font=FONT_SM, bg=BG,
+                 fg=C_ACCENT).grid(row=1, column=2)
+
+        for c in (self.canvas_rgb, self.canvas_depth, self.canvas_ir):
             c.bind("<Button-1>", self.on_click)
             c.bind("<MouseWheel>", self.on_wheel)
 
@@ -264,8 +293,9 @@ class App:
         self.lbl_diff = block("两者差值 (mm)")
         self.lbl_extra = block("激光波动 / 有效像素")
 
+        roitag = "已标定" if self.roi_loaded else "未标定"
         self.lbl_roi = tk.Label(panel, text=f"ROI ({self.roi_cx},{self.roi_cy}) "
-                                            f"边长 {self.roi_half * 2 + 1}px",
+                                            f"边长 {self.roi_half * 2 + 1}px · {roitag}",
                                 font=FONT_SM, bg=PANEL, fg=C_MUTED)
         self.lbl_roi.pack(anchor="w")
 
@@ -285,6 +315,10 @@ class App:
                   fg=C_TEXT, command=self.export, height=2).pack(side="left", padx=(8, 0))
         tk.Button(bar, text="清空", font=FONT, width=8, relief="flat", bg=PANEL,
                   fg=C_ACCENT, command=self.clear, height=2).pack(side="left", padx=(8, 0))
+        self.btn_emit = tk.Button(bar, text="关投影 · 看光斑", font=FONT, width=15,
+                                  relief="flat", bg=PANEL, fg=C_TEXT, height=2,
+                                  command=self.toggle_emitter)
+        self.btn_emit.pack(side="left", padx=(8, 0))
         self.lbl_count = tk.Label(bar, text="已记录 0 株", font=FONT_MID, bg=BG, fg=C_TEXT)
         self.lbl_count.pack(side="right")
 
@@ -393,7 +427,6 @@ class App:
             time.sleep(1 / 95)
 
     def _demo_cam(self):
-        import numpy as np
         self.cam_ok = True
         self.cam_msg = "演示模式"
         self.cam_info = "DEMO · 合成深度图（非真实数据）"
@@ -405,7 +438,7 @@ class App:
             color = np.zeros((h, w, 3), np.uint8)
             color[..., 1] = (xx * 255 // w).astype(np.uint8)
             color[..., 2] = (yy * 255 // h).astype(np.uint8)
-            item = (time.time(), color, depth)
+            item = (time.time(), color, depth, None)
             try:
                 self.cam_q.put_nowait(item)
             except queue.Full:
@@ -422,21 +455,51 @@ class App:
     def _cam_loop(self):
         try:
             import pyrealsense2 as rs
+            self._rs = rs
         except ImportError:
             self.cam_msg = "缺少 pyrealsense2"
             self.cam_info = "相机: 未安装 SDK"
             return
-        import cv2
-        import numpy as np
+        # 必须先确认设备存在再调用 pipeline.start()：
+        # 无设备时该调用会无限阻塞且不释放 GIL，会把整个进程锁死。
+        try:
+            ctx = rs.context()
+            if not list(ctx.query_devices()):
+                self.cam_msg = "未检测到相机"
+                self.cam_info = "相机: 未连接（检查 USB）"
+                return
+        except Exception:
+            pass
+
         try:
             pipeline = rs.pipeline()
             config = rs.config()
             config.enable_stream(rs.stream.color, SRC_W, SRC_H, rs.format.bgr8, 30)
             config.enable_stream(rs.stream.depth, SRC_W, SRC_H, rs.format.z16, 30)
-            profile = pipeline.start(config)
+            want_ir = True
+            try:
+                config.enable_stream(rs.stream.infrared, 1, SRC_W, SRC_H, rs.format.y8, 30)
+            except Exception:
+                want_ir = False
+            try:
+                profile = pipeline.start(config)
+            except Exception:
+                if not want_ir:
+                    raise
+                pipeline = rs.pipeline()
+                config = rs.config()
+                config.enable_stream(rs.stream.color, SRC_W, SRC_H, rs.format.bgr8, 30)
+                config.enable_stream(rs.stream.depth, SRC_W, SRC_H, rs.format.z16, 30)
+                profile = pipeline.start(config)
+                want_ir = False
+            self.has_ir = want_ir
             for sensor in profile.get_device().query_sensors():
                 if sensor.supports(rs.option.global_time_enabled):
                     sensor.set_option(rs.option.global_time_enabled, 1)
+            try:
+                self.depth_sensor = profile.get_device().first_depth_sensor()
+            except Exception:
+                self.depth_sensor = None
             align = rs.align(rs.stream.color)
             dev = profile.get_device()
             try:
@@ -472,9 +535,18 @@ class App:
             cframe = aligned.get_color_frame()
             if not dframe or not cframe:
                 continue
+            ir = None
+            if self.has_ir:
+                try:
+                    iframe = frames.get_infrared_frame(1)
+                    if iframe:
+                        ir = np.asanyarray(iframe.get_data()).copy()
+                except Exception:
+                    ir = None
             item = (frames.get_timestamp() / 1000.0,
                     np.asanyarray(cframe.get_data()).copy(),
-                    np.asanyarray(dframe.get_data()).copy())
+                    np.asanyarray(dframe.get_data()).copy(),
+                    ir)
             try:
                 self.cam_q.put_nowait(item)
             except queue.Full:
@@ -497,6 +569,26 @@ class App:
         self.cam_msg = "正在重连相机..."
         threading.Thread(target=self._cam_loop, daemon=True).start()
 
+    def toggle_emitter(self):
+        """关掉相机自带红外投影，让激光光斑成为红外图中唯一的亮点。"""
+        if self.depth_sensor is None or self._rs is None:
+            self.lbl_status.config(text="相机未连接，无法控制投影", fg=C_ACCENT)
+            return
+        try:
+            rs = self._rs
+            self.emitter_on = not self.emitter_on
+            self.depth_sensor.set_option(rs.option.emitter_enabled,
+                                         1 if self.emitter_on else 0)
+            if self.emitter_on:
+                self.btn_emit.config(text="关投影 · 看光斑", bg=PANEL, fg=C_TEXT)
+                self.lbl_status.config(text="投影已开启，深度恢复正常", fg=C_MUTED)
+            else:
+                self.btn_emit.config(text="开投影 · 恢复深度", bg="#FCEBEB", fg=C_ACCENT)
+                self.lbl_status.config(
+                    text="投影已关闭，红外图里最亮的点就是激光光斑", fg=C_ACCENT)
+        except Exception as exc:
+            self.lbl_status.config(text=f"投影控制失败: {exc}", fg=C_ACCENT)
+
     # ---------- 交互 ----------
 
     def on_click(self, event):
@@ -508,9 +600,32 @@ class App:
         self.roi_half = int(max(4, min(120, self.roi_half + (4 if event.delta > 0 else -4))))
         self._sync_roi_label()
 
+    def load_roi(self):
+        """加载上次标定的光斑位置，避免每次启动都要重新对准。"""
+        try:
+            with open(ROI_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            self.roi_cx = int(cfg.get("cx", SRC_W // 2))
+            self.roi_cy = int(cfg.get("cy", SRC_H // 2))
+            self.roi_half = int(cfg.get("half", 20))
+            self.roi_loaded = True
+        except Exception:
+            self.roi_loaded = False
+
+    def save_roi(self):
+        try:
+            with open(ROI_FILE, "w", encoding="utf-8") as f:
+                json.dump({"cx": self.roi_cx, "cy": self.roi_cy,
+                           "half": self.roi_half}, f, indent=2)
+            self.roi_loaded = True
+        except Exception:
+            pass
+
     def _sync_roi_label(self):
+        tag = "已标定" if self.roi_loaded else "未标定"
         self.lbl_roi.config(text=f"ROI ({self.roi_cx},{self.roi_cy}) "
-                                 f"边长 {self.roi_half * 2 + 1}px")
+                                 f"边长 {self.roi_half * 2 + 1}px · {tag}")
+        self.save_roi()
 
     def _laser_recent(self):
         now = time.time()
@@ -520,7 +635,6 @@ class App:
     def _roi_depth(self):
         if self.latest_depth is None:
             return None, 0, 0
-        import numpy as np
         d = self.latest_depth
         y0 = max(0, self.roi_cy - self.roi_half)
         y1 = min(SRC_H, self.roi_cy + self.roi_half + 1)
@@ -600,6 +714,18 @@ class App:
                             m["spread"], m["valid"], m["sync"], f"{m['t']:.3f}"])
         self.lbl_status.config(text=f"已导出 {len(self.marks)} 条", fg=C_OK)
 
+    def _bring_to_front(self):
+        """启动后把窗口顶到最前并夺取焦点，避免被已有窗口遮挡。"""
+        try:
+            self.root.deiconify()
+            self.root.state("normal")
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.root.after(800, lambda: self.root.attributes("-topmost", False))
+            self.root.focus_force()
+        except Exception:
+            pass
+
     def on_close(self):
         self.running = False
         try:
@@ -611,24 +737,30 @@ class App:
     # ---------- 主循环 ----------
 
     def pump(self):
-        import numpy as np
         got_img = False
         try:
-            ts, cimg, dimg = self.cam_q.get_nowait()
+            ts, cimg, dimg, ir = self.cam_q.get_nowait()
             self.latest_rgb = cimg
             self.latest_depth = dimg
+            self.latest_ir = ir
             self.latest_cam_t = ts
             got_img = True
         except queue.Empty:
             pass
 
-        while not self.scan_q.empty():
-            kind, payload = self.scan_q.get()
+        for _ in range(200):
+            try:
+                kind, payload = self.scan_q.get_nowait()
+            except queue.Empty:
+                break
             if kind == "hits":
                 self._handle_scan(payload)
 
-        while not self.laser_q.empty():
-            kind, payload = self.laser_q.get()
+        for _ in range(400):
+            try:
+                kind, payload = self.laser_q.get_nowait()
+            except queue.Empty:
+                break
             if kind == "error":
                 self.lbl_laser_dev.config(text=payload, fg=C_ACCENT)
                 continue
@@ -673,10 +805,6 @@ class App:
         self.lbl_extra.config(text=f"波动 {sp} / {n_valid}/{total} 像素")
 
     def _draw_images(self):
-        import cv2
-        import numpy as np
-        from PIL import Image, ImageTk
-
         rgb = cv2.resize(self.latest_rgb, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA)
         rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
 
@@ -699,6 +827,22 @@ class App:
         self.canvas_rgb.create_image(0, 0, anchor="nw", image=self.tk_rgb)
         self.canvas_depth.delete("all")
         self.canvas_depth.create_image(0, 0, anchor="nw", image=self.tk_dep)
+
+        self.canvas_ir.delete("all")
+        if self.latest_ir is not None:
+            irv = cv2.resize(self.latest_ir, (IMG_W, IMG_H), interpolation=cv2.INTER_AREA)
+            lo = float(np.percentile(irv, 5))
+            hi = float(np.percentile(irv, 99.5))
+            if hi - lo > 8:
+                irv = np.clip((irv.astype(np.float32) - lo) / (hi - lo) * 255,
+                              0, 255).astype(np.uint8)
+            ir_rgb = cv2.cvtColor(irv, cv2.COLOR_GRAY2RGB)
+            self.tk_ir = ImageTk.PhotoImage(Image.fromarray(ir_rgb))
+            self.canvas_ir.create_image(0, 0, anchor="nw", image=self.tk_ir)
+        else:
+            hint = "关闭投影后看光斑" if self.has_ir else "相机不支持红外流"
+            self.canvas_ir.create_text(IMG_W // 2, IMG_H // 2, text=hint,
+                                       fill="#888780", font=FONT_SM)
 
     def _draw_plot(self):
         c = self.canvas_plot
@@ -740,7 +884,38 @@ class App:
                       fill=C_MUTED, font=FONT_SM)
 
 
+def single_instance_guard():
+    """用 Windows 命名互斥体做单实例检测，进程退出时自动释放，不依赖端口。"""
+    try:
+        import win32api
+        import win32event
+        import winerror
+        mutex = win32event.CreateMutex(None, False, "Local\\TasselSyncGUI_v1")
+        if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+            return None
+        return mutex
+    except Exception:
+        return True
+
+
 def main():
+    guard = single_instance_guard()
+    if guard is None:
+        try:
+            tip = tk.Tk()
+            tip.withdraw()
+            win = tk.Toplevel(tip)
+            win.title("提示")
+            win.attributes("-topmost", True)
+            win.geometry("360x150+760+440")
+            tk.Label(win, text="界面已经在运行了\n请在任务栏或 Alt+Tab 里找一下窗口",
+                     font=("Microsoft YaHei", 12), padx=24, pady=32).pack()
+            tip.after(3000, tip.destroy)
+            tip.mainloop()
+        except Exception:
+            pass
+        sys.exit(0)
+
     missing = check_deps()
     hard = [m for m in missing if "(缺此项" not in m]
     if hard:
@@ -762,6 +937,15 @@ def main():
     demo = "--demo" in sys.argv
     port = args[0] if args else None
     baud = int(args[1]) if len(args) > 1 else 115200
+
+    # 必须在启动后台线程之前完成重量级模块加载，
+    # 否则主线程与后台线程会争抢全局 import 锁，导致界面卡在首帧。
+    try:
+        import numpy  # noqa: F401
+        import cv2  # noqa: F401
+        from PIL import Image, ImageTk  # noqa: F401
+    except ImportError:
+        pass
 
     root = tk.Tk()
     App(root, port, baud, use_laser, demo)
