@@ -11,6 +11,9 @@ env/
 *.bin
 raw_log.*
 
+# 本机标定配置
+roi_config.json
+
 # 编辑器
 .vscode/
 .idea/
